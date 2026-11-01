@@ -8,7 +8,7 @@ health and fitness data.
 import os
 import json
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Optional
 
 from mcp.server import Server
@@ -34,6 +34,8 @@ def get_garmin_client() -> Garmin:
     global _garmin_client
     
     if _garmin_client is not None:
+        if not _garmin_client.display_name:
+            _garmin_client.display_name = _garmin_client.garth.profile.get("displayName")
         return _garmin_client
     
     # Check for existing auth tokens
@@ -49,6 +51,7 @@ def get_garmin_client() -> Garmin:
         
         # Get display name to verify connection works
         display_name = client.garth.profile.get("displayName")
+        client.display_name = display_name
         logger.info(f"Authenticated as {display_name}")
         
         _garmin_client = client
@@ -74,6 +77,7 @@ def get_garmin_client() -> Garmin:
     # Create client with session
     client = Garmin()
     client.garth = garth.client
+    client.display_name = client.garth.profile.get("displayName")
     
     _garmin_client = client
     logger.info("Authenticated with Garmin credentials")
@@ -90,6 +94,101 @@ def parse_date(date_str: Optional[str]) -> date:
 def format_date(d: date) -> str:
     """Format date for Garmin API."""
     return d.strftime("%Y-%m-%d")
+
+
+def _number_between(value, low, high):
+    """Accept real JSON numbers, not booleans, strings or non-finite values."""
+    return type(value) in (int, float) and low <= value <= high
+
+
+def _readiness_time(record):
+    """Comparable ISO timestamp; naive Garmin timestamps use a fixed zone."""
+    timestamp = record.get("timestamp")
+    if not isinstance(timestamp, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _select_readiness(data, day):
+    """Prefer the requested day's primary-tracker wakeup observation."""
+    if isinstance(data, dict):
+        if data.get("calendarDate", day) == day and _number_between(data.get("score"), 0, 100):
+            return data, "legacy"
+        return None, None
+    if not isinstance(data, list):
+        return None, None
+    records = [r for r in data if isinstance(r, dict)
+               and r.get("calendarDate") == day
+               and _number_between(r.get("score"), 0, 100)
+               and (r.get("timestamp") is None or _readiness_time(r) is not None)]
+    morning = [r for r in records if r.get("inputContext") == "AFTER_WAKEUP_RESET"
+               and r.get("primaryActivityTracker") is True]
+    # A latest fallback must have a usable timestamp; list ordering is not chronology.
+    candidates = morning or [r for r in records if _readiness_time(r) is not None]
+    if not candidates:
+        return None, None
+
+    def ordering(record):
+        timestamp = _readiness_time(record)
+        return (timestamp if timestamp is not None else float("-inf"),
+                record.get("primaryActivityTracker") is True,
+                str(record.get("inputContext", "")), record["score"])
+
+    return max(candidates, key=ordering), "primary_tracker_morning" if morning else "latest"
+
+
+def _body_battery_levels(data, day):
+    """Extract observed levels from descriptor-indexed daily sample arrays."""
+    levels = []
+    if not isinstance(data, list):
+        return levels
+    for daily in data:
+        if not isinstance(daily, dict) or daily.get("date") != day:
+            continue
+        descriptors = daily.get("bodyBatteryValueDescriptorDTOList")
+        rows = daily.get("bodyBatteryValuesArray")
+        if not isinstance(descriptors, list) or not isinstance(rows, list):
+            continue
+        indices = {}
+        for key in ("timestamp", "bodyBatteryLevel"):
+            matches = [d.get("bodyBatteryValueDescriptorIndex") for d in descriptors
+                       if isinstance(d, dict) and d.get("bodyBatteryValueDescriptorKey") == key]
+            if len(matches) == 1 and type(matches[0]) is int and matches[0] >= 0:
+                indices[key] = matches[0]
+        if len(indices) != 2 or indices["timestamp"] == indices["bodyBatteryLevel"]:
+            continue
+        for row in rows:
+            if not isinstance(row, list) or len(row) <= max(indices.values()):
+                continue
+            timestamp, level = row[indices["timestamp"]], row[indices["bodyBatteryLevel"]]
+            if _number_between(timestamp, 0, 253402300799999) and _number_between(level, 0, 100):
+                levels.append(level)
+    return levels
+
+
+def _resting_heart_rate(data, day):
+    """Extract a numeric RHR from the verified allMetrics dictionary shape."""
+    if not isinstance(data, dict) or not isinstance(data.get("allMetrics"), dict):
+        return None
+    metrics = data["allMetrics"].get("metricsMap")
+    if not isinstance(metrics, dict):
+        return None
+    records = metrics.get("WELLNESS_RESTING_HEART_RATE")
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if not isinstance(record, dict) or record.get("calendarDate") != day:
+            continue
+        value = record.get("value")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < float("inf"):
+            return value
+    return None
 
 
 @server.list_tools()
@@ -189,9 +288,6 @@ async def get_daily_summary(client: Garmin, date_str: Optional[str]) -> dict:
     target_date = parse_date(date_str)
     date_formatted = format_date(target_date)
     
-    # Get display name for API calls
-    display_name = client.garth.profile.get("displayName")
-    
     summary = {
         "date": date_formatted,
         "sleep_score": None,
@@ -208,8 +304,12 @@ async def get_daily_summary(client: Garmin, date_str: Optional[str]) -> dict:
     # Get user summary (includes steps, stress, etc.)
     try:
         user_summary = client.get_user_summary(date_formatted)
-        summary["steps"] = user_summary.get("totalSteps")
-        summary["avg_stress"] = user_summary.get("averageStressLevel")
+        if isinstance(user_summary, dict) and user_summary.get("calendarDate", date_formatted) == date_formatted:
+            summary["steps"] = user_summary.get("totalSteps")
+            summary["avg_stress"] = user_summary.get("averageStressLevel")
+            rhr = user_summary.get("restingHeartRate")
+            if isinstance(rhr, (int, float)) and not isinstance(rhr, bool) and 0 < rhr < float("inf"):
+                summary["resting_heart_rate"] = rhr
     except Exception as e:
         logger.warning(f"Could not get user summary: {e}")
     
@@ -235,31 +335,31 @@ async def get_daily_summary(client: Garmin, date_str: Optional[str]) -> dict:
     # Get body battery
     try:
         bb_data = client.get_body_battery(date_formatted)
-        if bb_data and len(bb_data) > 0:
-            # Body battery returns array of readings
-            values = [r.get("bodyBatteryLevel") for r in bb_data if r.get("bodyBatteryLevel")]
-            if values:
-                summary["body_battery_high"] = max(values)
-                summary["body_battery_low"] = min(values)
+        values = _body_battery_levels(bb_data, date_formatted)
+        if values:
+            summary["body_battery_high"] = max(values)
+            summary["body_battery_low"] = min(values)
     except Exception as e:
         logger.warning(f"Could not get body battery: {e}")
     
     # Get training readiness
     try:
         readiness = client.get_training_readiness(date_formatted)
-        if readiness and "score" in readiness:
-            summary["training_readiness"] = readiness["score"]
+        record, selection = _select_readiness(readiness, date_formatted)
+        if record is not None:
+            summary["training_readiness"] = record["score"]
+            summary["training_readiness_context"] = record.get("inputContext")
+            summary["training_readiness_timestamp"] = record.get("timestamp")
+            summary["training_readiness_selection"] = selection
     except Exception as e:
         logger.warning(f"Could not get training readiness: {e}")
     
     # Get resting heart rate
     try:
         rhr_data = client.get_rhr_day(date_formatted)
-        if rhr_data and "allMetrics" in rhr_data:
-            for metric in rhr_data["allMetrics"]:
-                if metric.get("metricsMap", {}).get("WELLNESS_RESTING_HEART_RATE"):
-                    summary["resting_heart_rate"] = metric["metricsMap"]["WELLNESS_RESTING_HEART_RATE"]
-                    break
+        rhr = _resting_heart_rate(rhr_data, date_formatted)
+        if rhr is not None:
+            summary["resting_heart_rate"] = rhr
     except Exception as e:
         logger.warning(f"Could not get RHR: {e}")
     

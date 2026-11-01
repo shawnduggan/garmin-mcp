@@ -197,6 +197,33 @@ Retrieve comprehensive health metrics for a specific date.
 }
 ```
 
+**Metric semantics:**
+
+- Missing or unusable metrics remain `null`; the adapter does not estimate values.
+- `training_readiness` prefers a matching-`calendarDate`, primary-tracker
+  `AFTER_WAKEUP_RESET` record. If several morning records exist, the newest usable
+  timestamp wins. A morning record without a timestamp is still eligible; a
+  supplied but malformed timestamp is rejected. Without a morning record, the
+  newest timestamped record for that date is used, not relabeled as morning.
+  Numeric scores must be between 0 and 100 (including zero).
+- When a readiness record is selected, three additional fields identify it:
+  `training_readiness_context` and `training_readiness_timestamp` contain the
+  original values (or `null` if absent); `training_readiness_selection` is
+  `primary_tracker_morning`, `latest`, or `legacy`. Legacy single dictionaries
+  are accepted with a valid score and either no calendar date or the requested
+  date. These provenance fields are omitted when no record is selected.
+- `body_battery_high` / `body_battery_low` are extrema of **observed samples**,
+  not guaranteed full-day extrema. Only matching-`date` daily records with
+  unambiguous timestamp/level descriptor indices and valid numeric samples are
+  used. Levels from 0 through 100 are valid; malformed samples are skipped.
+  No samples means both fields are `null`. The daily record's date defines the
+  day; sample timestamps are not converted into the server's local timezone.
+- `resting_heart_rate` is a positive finite numeric scalar from the requested
+  day's `allMetrics.metricsMap.WELLNESS_RESTING_HEART_RATE` records. When that
+  endpoint is absent, malformed, or fails, the adapter uses a valid
+  `restingHeartRate` from the user summary (rejecting an explicitly different
+  calendar date). Steps, stress, sleep and HRV retain their existing fields.
+
 ### `get_summary_range`
 
 Retrieve health metrics for a date range, useful for trend analysis.
@@ -398,6 +425,18 @@ The Garmin Connect API access is powered by the [garminconnect](https://github.c
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
+
+## Tests
+
+Run the adapter regression suite with the existing environment:
+
+```bash
+venv/bin/python -W error -m unittest discover -s tests -v
+```
+
+Tests use synthetic response shapes, fake authentication/session operations, and
+blocked outbound socket connections. They do not read saved tokens, log in to
+Garmin, or make network requests. No additional test dependency is required.
 
 ## Contributing
 
